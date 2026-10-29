@@ -1,0 +1,95 @@
+name: terragrunt
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TG_NON_INTERACTIVE: "true"
+  TG_NO_TIPS: "true"
+
+# Third-party actions are pinned to commit SHAs (tags are mutable).
+jobs:
+  # No cloud credentials at all: local backend + dependency mock outputs.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4, versions from mise.toml
+
+      - name: Format
+        run: |
+          terraform fmt -check -recursive -diff
+          terragrunt hcl format --check --diff
+
+      - name: Lint (tflint)
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when tflint downloads the AWS ruleset
+
+      - name: Validate all units
+        working-directory: environments
+        run: terragrunt run --all --provider-cache validate
+        env:
+          TG_BACKEND: local
+
+      - name: Security scan (trivy)
+        run: trivy config --severity HIGH,CRITICAL --exit-code 1 modules
+
+  # Real plan per environment with a read-only role assumed via GitHub OIDC (no long-lived keys).
+  # The job runs in the GitHub environment `<env>-plan`; the role's trust policy only accepts that environment.
+  # Skipped until the repository variable AWS_PLAN_ROLE_ARN_<ENV> is set (see bootstrap/github-oidc.sh).
+  plan:
+    needs: static
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            role_var: AWS_PLAN_ROLE_ARN_DEV
+    environment: ${{ matrix.env }}-plan
+    env:
+      ROLE_ARN: ${{ vars[matrix.role_var] }}
+    steps:
+      - name: Skip when no role is configured
+        if: env.ROLE_ARN == ''
+        run: echo "::notice::${{ matrix.role_var }} not set; skipping plan."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.ROLE_ARN != ''
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+        if: env.ROLE_ARN != ''
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: env.ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: gh-${{ github.run_id }}-${{ matrix.env }}
+          aws-region: eu-central-1
+
+      # -lock=false: the role is read-only and a plan never writes state.
+      - name: Plan ${{ matrix.env }}
+        if: env.ROLE_ARN != ''
+        working-directory: environments/${{ matrix.env }}
+        run: terragrunt run --all --provider-cache plan -- -lock=false -input=false
