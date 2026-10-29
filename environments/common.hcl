@@ -6,5 +6,7 @@ locals {
   # Bumping a version here rolls out to every environment alike.
   module_versions = {
     vpc = "6.7.3"
+    alb = "10.5.1"
+    ecs = "7.6.1"
   }
 }

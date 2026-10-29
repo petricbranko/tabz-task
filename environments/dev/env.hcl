@@ -5,4 +5,7 @@ locals {
 
   vpc_cidr = "10.10.0.0/16"
   az_count = 2 # ALB minimum; cost over resilience in dev
+
+  # ACM certificate for the ALB. Empty = HTTP-only listener (fine for a plan / throwaway dev).
+  certificate_arn = ""
 }
