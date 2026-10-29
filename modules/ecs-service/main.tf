@@ -4,9 +4,12 @@
 # Wraps the official terraform-aws-modules/ecs//modules/service and adds the pieces every service in this platform
 # needs but the upstream module deliberately leaves out:
 #   - its own ALB target group + listener rule on the shared ALB
-#   - security group wiring to the ALB in both directions
+#   - bidirectional security group wiring to the ALB (upstream) and to data stores (downstream)
+#   - least-privilege execution role for injecting Secrets Manager values (incl. KMS decrypt)
 #   - hardened container defaults (read-only root FS, non-root image, no public IP)
 ################################################################################
+
+data "aws_region" "current" {}
 
 locals {
   lb_enabled = var.load_balancer != null
@@ -52,6 +55,7 @@ locals {
     }]
 
     environment = [for k, v in var.container.environment : { name = k, value = v }]
+    secrets     = [for k, v in var.container.secrets : { name = k, valueFrom = v }]
 
     readonlyRootFilesystem = true
     mountPoints            = local.scratch_mounts
@@ -66,6 +70,19 @@ locals {
     }
 
     cloudwatch_log_group_retention_in_days = var.log_retention_in_days
+  }
+
+  sidecar_containers = {
+    for k, s in var.sidecars : k => {
+      name                                   = k
+      image                                  = s.image
+      essential                              = s.essential
+      command                                = s.command
+      environment                            = [for ek, ev in s.environment : { name = ek, value = ev }]
+      secrets                                = [for sk, sv in s.secrets : { name = sk, valueFrom = sv }]
+      readonlyRootFilesystem                 = true
+      cloudwatch_log_group_retention_in_days = var.log_retention_in_days
+    }
   }
 }
 
@@ -87,7 +104,7 @@ module "service" {
     operating_system_family = "LINUX"
     cpu_architecture        = var.cpu_architecture
   }
-  container_definitions = merge({ (var.container.name) = local.app_container }, local.volume_init_container)
+  container_definitions = merge({ (var.container.name) = local.app_container }, local.volume_init_container, local.sidecar_containers)
   volume                = { for vol, _ in local.scratch_volumes : vol => {} }
 
   # Service
@@ -122,6 +139,19 @@ module "service" {
   # subnet with a data source, which fails on `plan` against an empty account where subnet IDs are still mocks.
   create_security_group = false
   security_group_ids    = [aws_security_group.this.id]
+
+  # Execution role: used by the ECS agent to pull the image, write logs and inject secrets at task start.
+  task_exec_secret_arns = var.secret_arns
+  task_exec_iam_statements = length(var.kms_key_arns) == 0 ? null : [{
+    sid       = "DecryptSecretsViaSecretsManager"
+    actions   = ["kms:Decrypt"]
+    resources = var.kms_key_arns
+    condition = [{
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.${data.aws_region.current.region}.amazonaws.com"]
+    }]
+  }]
 
   # Task role: what the application itself may call at runtime. ECS Exec permissions are added by the module
   # when enable_execute_command = true.
@@ -194,9 +224,10 @@ resource "aws_lb_listener_rule" "this" {
 ################################################################################
 # Security groups
 #
-# Every rule is SG-referenced (no CIDRs except HTTPS egress to AWS APIs). The ALB has no egress rules of its own:
-# the service "registers" itself, i.e. it adds the ALB egress rule pointing at its own SG and port. Destroying the
-# service removes exactly its own rules and nothing else.
+# Every rule is SG-referenced (no CIDRs except HTTPS egress to AWS APIs). Dependencies flow
+# network -> data stores -> service, so the service is the only unit that knows both sides: it "registers"
+# itself, i.e. the ALB may reach it and it may reach its downstreams. Destroying the service removes exactly its
+# own rules and nothing else.
 ################################################################################
 
 resource "aws_security_group" "this" {
@@ -247,6 +278,32 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_service" {
   to_port                      = var.container.port
   ip_protocol                  = "tcp"
   description                  = "ALB to ${var.name}"
+
+  tags = var.tags
+}
+
+resource "aws_vpc_security_group_egress_rule" "to_downstream" {
+  for_each = var.downstream_security_groups
+
+  security_group_id            = aws_security_group.this.id
+  referenced_security_group_id = each.value.security_group_id
+  from_port                    = each.value.port
+  to_port                      = each.value.port
+  ip_protocol                  = "tcp"
+  description                  = "To ${each.key}"
+
+  tags = var.tags
+}
+
+resource "aws_vpc_security_group_ingress_rule" "downstream_from_service" {
+  for_each = var.downstream_security_groups
+
+  security_group_id            = each.value.security_group_id
+  referenced_security_group_id = aws_security_group.this.id
+  from_port                    = each.value.port
+  to_port                      = each.value.port
+  ip_protocol                  = "tcp"
+  description                  = "${var.name} to ${each.key}"
 
   tags = var.tags
 }

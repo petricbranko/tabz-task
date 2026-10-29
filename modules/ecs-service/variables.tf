@@ -73,6 +73,7 @@ variable "cpu_architecture" {
 variable "container" {
   description = <<-EOT
     Main application container.
+      secrets        - map of ENV_VAR => Secrets Manager valueFrom (ARN or ARN:json-key::), injected at task start
       writable_paths - paths that need to be writable despite the read-only root file system
   EOT
   type = object({
@@ -81,9 +82,22 @@ variable "container" {
     port                 = number
     command              = optional(list(string))
     environment          = optional(map(string), {})
+    secrets              = optional(map(string), {})
     health_check_command = optional(list(string))
     writable_paths       = optional(list(string), [])
   })
+}
+
+variable "sidecars" {
+  description = "Additional containers in the task (e.g. probes, log routers). Non-essential by default"
+  type = map(object({
+    image       = string
+    essential   = optional(bool, false)
+    command     = optional(list(string))
+    environment = optional(map(string), {})
+    secrets     = optional(map(string), {})
+  }))
+  default = {}
 }
 
 variable "volume_init_image" {
@@ -102,6 +116,18 @@ variable "log_retention_in_days" {
 # IAM
 ################################################################################
 
+variable "secret_arns" {
+  description = "Secrets Manager secret ARNs the execution role may read (must cover every valueFrom used)"
+  type        = list(string)
+  default     = []
+}
+
+variable "kms_key_arns" {
+  description = "KMS keys encrypting those secrets; decrypt is only allowed via Secrets Manager"
+  type        = list(string)
+  default     = []
+}
+
 variable "task_role_statements" {
   description = "IAM statements for the task role (the application's own runtime permissions)"
   type        = any
@@ -109,7 +135,7 @@ variable "task_role_statements" {
 }
 
 variable "enable_execute_command" {
-  description = "Enable ECS Exec (SSM) for interactive debugging inside running tasks"
+  description = "Enable ECS Exec (SSM) for interactive debugging, e.g. to run redis-cli from inside the task"
   type        = bool
   default     = false
 }
@@ -137,6 +163,22 @@ variable "health_check_grace_period_seconds" {
   description = "Seconds to ignore failing ALB health checks after a task starts"
   type        = number
   default     = 30
+}
+
+################################################################################
+# Connectivity to data stores
+################################################################################
+
+variable "downstream_security_groups" {
+  description = <<-EOT
+    Security groups this service must reach, keyed by a short name (e.g. redis). For each entry the module adds
+    an egress rule on the service SG and a matching ingress rule on the target SG, both SG-referenced.
+  EOT
+  type = map(object({
+    security_group_id = string
+    port              = number
+  }))
+  default = {}
 }
 
 ################################################################################

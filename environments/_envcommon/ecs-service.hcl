@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------------------------------------------------
 # ECS service - modules/ecs-service
-# Wires a service unit to the shared platform units (VPC, cluster, ALB). Service-specific settings (image, sizing)
-# live in environments/<env>/<region>/services/<service>/terragrunt.hcl.
+# Wires a service unit to the shared platform units (VPC, cluster, ALB, Redis, KMS). Service-specific settings
+# (image, sizing) live in environments/<env>/<region>/services/<service>/terragrunt.hcl.
 # ---------------------------------------------------------------------------------------------------------------------
 
 locals {
@@ -50,6 +50,27 @@ dependency "alb" {
   }
 }
 
+dependency "redis" {
+  config_path = "${local.region_dir}/redis"
+
+  mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
+  mock_outputs = {
+    primary_endpoint_address = "master.mock.xxxxxx.euc1.cache.amazonaws.com"
+    port                     = 6379
+    security_group_id        = "sg-00000000000000002"
+    secret_arn               = "arn:aws:secretsmanager:eu-central-1:111111111111:secret:mock/redis-AbCdEf"
+  }
+}
+
+dependency "kms" {
+  config_path = "${local.region_dir}/kms"
+
+  mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
+  mock_outputs = {
+    key_arn = "arn:aws:kms:eu-central-1:111111111111:key/00000000-0000-0000-0000-000000000000"
+  }
+}
+
 inputs = {
   name        = local.name
   cluster_arn = dependency.ecs_cluster.outputs.arn
@@ -60,5 +81,49 @@ inputs = {
     listener_arn      = dependency.alb.outputs.listeners[local.listener_key].arn
     security_group_id = dependency.alb.outputs.security_group_id
     priority          = 100
+  }
+
+  # SG-to-SG rule pair: service -> redis:6379 egress + redis <- service ingress.
+  downstream_security_groups = {
+    redis = {
+      security_group_id = dependency.redis.outputs.security_group_id
+      port              = dependency.redis.outputs.port
+    }
+  }
+
+  secret_arns  = [dependency.redis.outputs.secret_arn]
+  kms_key_arns = [dependency.kms.outputs.key_arn]
+
+  # Deep-merged with the unit's `container` (which adds image, port, health check...).
+  container = {
+    environment = {
+      REDIS_HOST = dependency.redis.outputs.primary_endpoint_address
+      REDIS_PORT = tostring(dependency.redis.outputs.port)
+      REDIS_TLS  = "true"
+    }
+    # The one secret: injected by the ECS agent at task start from Secrets Manager (JSON key `auth_token`).
+    secrets = {
+      REDIS_AUTH_TOKEN = "${dependency.redis.outputs.secret_arn}:auth_token::"
+    }
+  }
+
+  # Connectivity proof without writing app code: a non-essential sidecar that PINGs Redis over TLS with the
+  # injected AUTH token every 30s and logs OK/FAIL to CloudWatch. It exercises exactly the path the app uses:
+  # same task ENI + SG, same subnets/route tables, same secret.
+  sidecars = {
+    redis-probe = {
+      image = "public.ecr.aws/docker/library/redis:7.4-alpine"
+      command = [
+        "sh", "-c",
+        "while true; do if redis-cli -h \"$REDIS_HOST\" -p \"$REDIS_PORT\" --tls --cacert /etc/ssl/certs/ca-certificates.crt -a \"$REDIS_AUTH_TOKEN\" --no-auth-warning PING | grep -q PONG; then echo \"redis-probe OK host=$REDIS_HOST\"; else echo \"redis-probe FAIL host=$REDIS_HOST\"; fi; sleep 30; done",
+      ]
+      environment = {
+        REDIS_HOST = dependency.redis.outputs.primary_endpoint_address
+        REDIS_PORT = tostring(dependency.redis.outputs.port)
+      }
+      secrets = {
+        REDIS_AUTH_TOKEN = "${dependency.redis.outputs.secret_arn}:auth_token::"
+      }
+    }
   }
 }

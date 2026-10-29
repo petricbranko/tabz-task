@@ -7,7 +7,8 @@ that adds what every service here needs and upstream intentionally leaves out:
 | Concern | What the wrapper does |
 |---|---|
 | Load balancing | Own target group (`ip` targets) + listener rule on the **shared** ALB; no ALB changes per service |
-| Network security | Creates the service SG. ALB → service is SG-referenced in both directions: the module also writes the ALB egress rule, so the ALB can only reach registered services |
+| Network security | Creates the service SG. All rules SG-referenced: ALB → service, service → downstreams (e.g. Redis). It also writes the matching rule on the *other* SG (ALB egress, Redis ingress), so each side only allows exactly this service |
+| Secrets | `container.secrets` → ECS `secrets[].valueFrom`; execution role gets `GetSecretValue` on exactly those ARNs + `kms:Decrypt` only via Secrets Manager |
 | Hardening | Read-only root FS, private subnets, no public IP. Writable paths are ephemeral task volumes, made writable for non-root images by an init container |
 | Deployments | Rolling 100%/200%, circuit breaker with automatic rollback, AZ rebalancing |
 
@@ -25,13 +26,21 @@ module "web" {
   container = {
     image          = "public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine"
     port           = 8080
+    environment    = { REDIS_HOST = module.redis.primary_endpoint_address }
+    secrets        = { REDIS_AUTH_TOKEN = "${module.redis.secret_arn}:auth_token::" }
     writable_paths = ["/tmp"]
   }
+  secret_arns  = [module.redis.secret_arn]
+  kms_key_arns = [module.kms.key_arn]
 
   load_balancer = {
     listener_arn      = module.alb.listeners["http"].arn
     security_group_id = module.alb.security_group_id
     priority          = 100
+  }
+
+  downstream_security_groups = {
+    redis = { security_group_id = module.redis.security_group_id, port = 6379 }
   }
 }
 ```
@@ -65,7 +74,10 @@ module "web" {
 | [aws_security_group.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
 | [aws_vpc_security_group_egress_rule.alb_to_service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_egress_rule) | resource |
 | [aws_vpc_security_group_egress_rule.https](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_egress_rule) | resource |
+| [aws_vpc_security_group_egress_rule.to_downstream](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_egress_rule) | resource |
+| [aws_vpc_security_group_ingress_rule.downstream_from_service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule) | resource |
 | [aws_vpc_security_group_ingress_rule.from_alb](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule) | resource |
+| [aws_region.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/region) | data source |
 
 ## Inputs
 
@@ -73,16 +85,20 @@ module "web" {
 | ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_capacity_provider_strategy"></a> [capacity\_provider\_strategy](#input\_capacity\_provider\_strategy) | Capacity provider strategy, e.g. FARGATE base + FARGATE\_SPOT for burst | <pre>map(object({<br/>    capacity_provider = string<br/>    base              = optional(number)<br/>    weight            = optional(number)<br/>  }))</pre> | <pre>{<br/>  "fargate": {<br/>    "base": 1,<br/>    "capacity_provider": "FARGATE",<br/>    "weight": 1<br/>  }<br/>}</pre> | no |
 | <a name="input_cluster_arn"></a> [cluster\_arn](#input\_cluster\_arn) | ARN of the ECS cluster | `string` | n/a | yes |
-| <a name="input_container"></a> [container](#input\_container) | Main application container.<br/>  writable\_paths - paths that need to be writable despite the read-only root file system | <pre>object({<br/>    name                 = optional(string, "app")<br/>    image                = string<br/>    port                 = number<br/>    command              = optional(list(string))<br/>    environment          = optional(map(string), {})<br/>    health_check_command = optional(list(string))<br/>    writable_paths       = optional(list(string), [])<br/>  })</pre> | n/a | yes |
+| <a name="input_container"></a> [container](#input\_container) | Main application container.<br/>  secrets        - map of ENV\_VAR => Secrets Manager valueFrom (ARN or ARN:json-key::), injected at task start<br/>  writable\_paths - paths that need to be writable despite the read-only root file system | <pre>object({<br/>    name                 = optional(string, "app")<br/>    image                = string<br/>    port                 = number<br/>    command              = optional(list(string))<br/>    environment          = optional(map(string), {})<br/>    secrets              = optional(map(string), {})<br/>    health_check_command = optional(list(string))<br/>    writable_paths       = optional(list(string), [])<br/>  })</pre> | n/a | yes |
 | <a name="input_cpu"></a> [cpu](#input\_cpu) | Task CPU units (256 = 0.25 vCPU) | `number` | `256` | no |
 | <a name="input_cpu_architecture"></a> [cpu\_architecture](#input\_cpu\_architecture) | X86\_64 or ARM64 (Graviton, ~20% cheaper if the image is multi-arch) | `string` | `"X86_64"` | no |
 | <a name="input_desired_count"></a> [desired\_count](#input\_desired\_count) | Number of tasks to run | `number` | `1` | no |
-| <a name="input_enable_execute_command"></a> [enable\_execute\_command](#input\_enable\_execute\_command) | Enable ECS Exec (SSM) for interactive debugging inside running tasks | `bool` | `false` | no |
+| <a name="input_downstream_security_groups"></a> [downstream\_security\_groups](#input\_downstream\_security\_groups) | Security groups this service must reach, keyed by a short name (e.g. redis). For each entry the module adds<br/>an egress rule on the service SG and a matching ingress rule on the target SG, both SG-referenced. | <pre>map(object({<br/>    security_group_id = string<br/>    port              = number<br/>  }))</pre> | `{}` | no |
+| <a name="input_enable_execute_command"></a> [enable\_execute\_command](#input\_enable\_execute\_command) | Enable ECS Exec (SSM) for interactive debugging, e.g. to run redis-cli from inside the task | `bool` | `false` | no |
 | <a name="input_health_check_grace_period_seconds"></a> [health\_check\_grace\_period\_seconds](#input\_health\_check\_grace\_period\_seconds) | Seconds to ignore failing ALB health checks after a task starts | `number` | `30` | no |
+| <a name="input_kms_key_arns"></a> [kms\_key\_arns](#input\_kms\_key\_arns) | KMS keys encrypting those secrets; decrypt is only allowed via Secrets Manager | `list(string)` | `[]` | no |
 | <a name="input_load_balancer"></a> [load\_balancer](#input\_load\_balancer) | Attach the service to a shared ALB listener. null = no load balancer (worker service) | <pre>object({<br/>    listener_arn         = string<br/>    security_group_id    = string<br/>    priority             = number<br/>    path_patterns        = optional(list(string), ["/*"])<br/>    host_headers         = optional(list(string), [])<br/>    health_check_path    = optional(string, "/")<br/>    health_check_matcher = optional(string, "200")<br/>    deregistration_delay = optional(number, 30)<br/>  })</pre> | `null` | no |
 | <a name="input_log_retention_in_days"></a> [log\_retention\_in\_days](#input\_log\_retention\_in\_days) | CloudWatch log retention for all containers of the service | `number` | `14` | no |
 | <a name="input_memory"></a> [memory](#input\_memory) | Task memory in MiB | `number` | `512` | no |
 | <a name="input_name"></a> [name](#input\_name) | Service name, e.g. tabz-prod-web. Used for the service, task family, SG, target group (max 32 chars) | `string` | n/a | yes |
+| <a name="input_secret_arns"></a> [secret\_arns](#input\_secret\_arns) | Secrets Manager secret ARNs the execution role may read (must cover every valueFrom used) | `list(string)` | `[]` | no |
+| <a name="input_sidecars"></a> [sidecars](#input\_sidecars) | Additional containers in the task (e.g. probes, log routers). Non-essential by default | <pre>map(object({<br/>    image       = string<br/>    essential   = optional(bool, false)<br/>    command     = optional(list(string))<br/>    environment = optional(map(string), {})<br/>    secrets     = optional(map(string), {})<br/>  }))</pre> | `{}` | no |
 | <a name="input_subnet_ids"></a> [subnet\_ids](#input\_subnet\_ids) | Private subnets for the task ENIs | `list(string)` | n/a | yes |
 | <a name="input_tags"></a> [tags](#input\_tags) | Additional tags (provider default\_tags already cover the standard set) | `map(string)` | `{}` | no |
 | <a name="input_task_role_statements"></a> [task\_role\_statements](#input\_task\_role\_statements) | IAM statements for the task role (the application's own runtime permissions) | `any` | `null` | no |
