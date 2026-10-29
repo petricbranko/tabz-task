@@ -5,6 +5,7 @@
 # needs but the upstream module deliberately leaves out:
 #   - its own ALB target group + listener rule on the shared ALB
 #   - bidirectional security group wiring to the ALB (upstream) and to data stores (downstream)
+#   - request-count + CPU target tracking autoscaling with sane cooldowns
 #   - least-privilege execution role for injecting Secrets Manager values (incl. KMS decrypt)
 #   - hardened container defaults (read-only root FS, non-root image, no public IP)
 ################################################################################
@@ -84,10 +85,51 @@ locals {
       cloudwatch_log_group_retention_in_days = var.log_retention_in_days
     }
   }
+
+  autoscaling_enabled = var.autoscaling != null
+
+  # Policies are built with filtered for-expressions (not `cond ? {...} : {}`) so both branches keep one type.
+  autoscaling_policies = merge(
+    # Primary signal for a web tier: load per task as seen by the ALB. Reacts before CPU saturates and works
+    # for I/O-bound apps where CPU never moves.
+    {
+      for k, v in {
+        requests = {
+          policy_type = "TargetTrackingScaling"
+          target_tracking_scaling_policy_configuration = {
+            predefined_metric_specification = {
+              predefined_metric_type = "ALBRequestCountPerTarget"
+              resource_label         = "${try(var.load_balancer.alb_arn_suffix, "")}/${try(aws_lb_target_group.this[0].arn_suffix, "")}"
+            }
+            target_value       = try(var.autoscaling.requests_per_target, 0)
+            scale_in_cooldown  = try(var.autoscaling.scale_in_cooldown, 300)
+            scale_out_cooldown = try(var.autoscaling.scale_out_cooldown, 60)
+          }
+        }
+      } : k => v if local.lb_enabled && try(var.autoscaling.requests_per_target, null) != null
+    },
+    # Safety net for CPU-heavy requests. Target tracking with several policies scales out on whichever needs
+    # the most capacity and only scales in when all of them agree.
+    {
+      for k, v in {
+        cpu = {
+          policy_type = "TargetTrackingScaling"
+          target_tracking_scaling_policy_configuration = {
+            predefined_metric_specification = {
+              predefined_metric_type = "ECSServiceAverageCPUUtilization"
+            }
+            target_value       = try(var.autoscaling.cpu_target, 0)
+            scale_in_cooldown  = try(var.autoscaling.scale_in_cooldown, 300)
+            scale_out_cooldown = try(var.autoscaling.scale_out_cooldown, 60)
+          }
+        }
+      } : k => v if try(var.autoscaling.cpu_target, null) != null
+    },
+  )
 }
 
 ################################################################################
-# Service, task definition, IAM roles
+# Service, task definition, IAM roles, security group, autoscaling
 ################################################################################
 
 module "service" {
@@ -110,7 +152,7 @@ module "service" {
   # Service
   launch_type                        = "FARGATE"
   capacity_provider_strategy         = var.capacity_provider_strategy
-  desired_count                      = var.desired_count
+  desired_count                      = local.autoscaling_enabled ? var.autoscaling.min_capacity : var.desired_count
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
   deployment_circuit_breaker = {
@@ -157,8 +199,12 @@ module "service" {
   # when enable_execute_command = true.
   tasks_iam_role_statements = var.task_role_statements
 
-  # Upstream enables CPU + memory autoscaling by default; keep a fixed desired_count instead.
-  enable_autoscaling = false
+  # Autoscaling. Upstream defaults to CPU + memory policies; we always pass our own (or disable it).
+  enable_autoscaling            = local.autoscaling_enabled
+  autoscaling_min_capacity      = try(var.autoscaling.min_capacity, 1)
+  autoscaling_max_capacity      = try(var.autoscaling.max_capacity, 1)
+  autoscaling_policies          = local.autoscaling_policies
+  autoscaling_scheduled_actions = try(var.autoscaling.scheduled_actions, null)
 
   tags = var.tags
 }

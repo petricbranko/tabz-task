@@ -148,6 +148,7 @@ variable "load_balancer" {
   description = "Attach the service to a shared ALB listener. null = no load balancer (worker service)"
   type = object({
     listener_arn         = string
+    alb_arn_suffix       = string
     security_group_id    = string
     priority             = number
     path_patterns        = optional(list(string), ["/*"])
@@ -182,13 +183,42 @@ variable "downstream_security_groups" {
 }
 
 ################################################################################
-# Deployment
+# Scaling & deployment
 ################################################################################
 
 variable "desired_count" {
-  description = "Number of tasks to run"
+  description = "Task count when autoscaling is disabled"
   type        = number
   default     = 1
+}
+
+variable "autoscaling" {
+  description = <<-EOT
+    Target tracking autoscaling. null disables it.
+      requests_per_target - ALBRequestCountPerTarget target (requests per task per minute)
+      cpu_target          - average CPU % target (safety net)
+      scheduled_actions   - e.g. scale dev to zero outside office hours
+  EOT
+  type = object({
+    min_capacity        = number
+    max_capacity        = number
+    requests_per_target = optional(number)
+    cpu_target          = optional(number)
+    scale_in_cooldown   = optional(number, 300)
+    scale_out_cooldown  = optional(number, 60)
+    scheduled_actions = optional(map(object({
+      min_capacity = number
+      max_capacity = number
+      schedule     = string
+      timezone     = optional(string)
+    })))
+  })
+  default = null
+
+  validation {
+    condition     = var.autoscaling == null || try(var.autoscaling.min_capacity <= var.autoscaling.max_capacity, false)
+    error_message = "autoscaling.min_capacity must be <= autoscaling.max_capacity."
+  }
 }
 
 variable "wait_for_steady_state" {

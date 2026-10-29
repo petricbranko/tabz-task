@@ -11,6 +11,7 @@ that adds what every service here needs and upstream intentionally leaves out:
 | Secrets | `container.secrets` → ECS `secrets[].valueFrom`; execution role gets `GetSecretValue` on exactly those ARNs + `kms:Decrypt` only via Secrets Manager |
 | Hardening | Read-only root FS, private subnets, no public IP. Writable paths are ephemeral task volumes, made writable for non-root images by an init container |
 | Deployments | Rolling 100%/200%, circuit breaker with automatic rollback, AZ rebalancing |
+| Scaling | Target tracking on `ALBRequestCountPerTarget` (primary) + CPU (safety net), optional schedules |
 
 ## Usage
 
@@ -35,6 +36,7 @@ module "web" {
 
   load_balancer = {
     listener_arn      = module.alb.listeners["http"].arn
+    alb_arn_suffix    = module.alb.arn_suffix
     security_group_id = module.alb.security_group_id
     priority          = 100
   }
@@ -42,6 +44,8 @@ module "web" {
   downstream_security_groups = {
     redis = { security_group_id = module.redis.security_group_id, port = 6379 }
   }
+
+  autoscaling = { min_capacity = 1, max_capacity = 4, requests_per_target = 1000, cpu_target = 70 }
 }
 ```
 
@@ -83,17 +87,18 @@ module "web" {
 
 | Name | Description | Type | Default | Required |
 | ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_autoscaling"></a> [autoscaling](#input\_autoscaling) | Target tracking autoscaling. null disables it.<br/>  requests\_per\_target - ALBRequestCountPerTarget target (requests per task per minute)<br/>  cpu\_target          - average CPU % target (safety net)<br/>  scheduled\_actions   - e.g. scale dev to zero outside office hours | <pre>object({<br/>    min_capacity        = number<br/>    max_capacity        = number<br/>    requests_per_target = optional(number)<br/>    cpu_target          = optional(number)<br/>    scale_in_cooldown   = optional(number, 300)<br/>    scale_out_cooldown  = optional(number, 60)<br/>    scheduled_actions = optional(map(object({<br/>      min_capacity = number<br/>      max_capacity = number<br/>      schedule     = string<br/>      timezone     = optional(string)<br/>    })))<br/>  })</pre> | `null` | no |
 | <a name="input_capacity_provider_strategy"></a> [capacity\_provider\_strategy](#input\_capacity\_provider\_strategy) | Capacity provider strategy, e.g. FARGATE base + FARGATE\_SPOT for burst | <pre>map(object({<br/>    capacity_provider = string<br/>    base              = optional(number)<br/>    weight            = optional(number)<br/>  }))</pre> | <pre>{<br/>  "fargate": {<br/>    "base": 1,<br/>    "capacity_provider": "FARGATE",<br/>    "weight": 1<br/>  }<br/>}</pre> | no |
 | <a name="input_cluster_arn"></a> [cluster\_arn](#input\_cluster\_arn) | ARN of the ECS cluster | `string` | n/a | yes |
 | <a name="input_container"></a> [container](#input\_container) | Main application container.<br/>  secrets        - map of ENV\_VAR => Secrets Manager valueFrom (ARN or ARN:json-key::), injected at task start<br/>  writable\_paths - paths that need to be writable despite the read-only root file system | <pre>object({<br/>    name                 = optional(string, "app")<br/>    image                = string<br/>    port                 = number<br/>    command              = optional(list(string))<br/>    environment          = optional(map(string), {})<br/>    secrets              = optional(map(string), {})<br/>    health_check_command = optional(list(string))<br/>    writable_paths       = optional(list(string), [])<br/>  })</pre> | n/a | yes |
 | <a name="input_cpu"></a> [cpu](#input\_cpu) | Task CPU units (256 = 0.25 vCPU) | `number` | `256` | no |
 | <a name="input_cpu_architecture"></a> [cpu\_architecture](#input\_cpu\_architecture) | X86\_64 or ARM64 (Graviton, ~20% cheaper if the image is multi-arch) | `string` | `"X86_64"` | no |
-| <a name="input_desired_count"></a> [desired\_count](#input\_desired\_count) | Number of tasks to run | `number` | `1` | no |
+| <a name="input_desired_count"></a> [desired\_count](#input\_desired\_count) | Task count when autoscaling is disabled | `number` | `1` | no |
 | <a name="input_downstream_security_groups"></a> [downstream\_security\_groups](#input\_downstream\_security\_groups) | Security groups this service must reach, keyed by a short name (e.g. redis). For each entry the module adds<br/>an egress rule on the service SG and a matching ingress rule on the target SG, both SG-referenced. | <pre>map(object({<br/>    security_group_id = string<br/>    port              = number<br/>  }))</pre> | `{}` | no |
 | <a name="input_enable_execute_command"></a> [enable\_execute\_command](#input\_enable\_execute\_command) | Enable ECS Exec (SSM) for interactive debugging, e.g. to run redis-cli from inside the task | `bool` | `false` | no |
 | <a name="input_health_check_grace_period_seconds"></a> [health\_check\_grace\_period\_seconds](#input\_health\_check\_grace\_period\_seconds) | Seconds to ignore failing ALB health checks after a task starts | `number` | `30` | no |
 | <a name="input_kms_key_arns"></a> [kms\_key\_arns](#input\_kms\_key\_arns) | KMS keys encrypting those secrets; decrypt is only allowed via Secrets Manager | `list(string)` | `[]` | no |
-| <a name="input_load_balancer"></a> [load\_balancer](#input\_load\_balancer) | Attach the service to a shared ALB listener. null = no load balancer (worker service) | <pre>object({<br/>    listener_arn         = string<br/>    security_group_id    = string<br/>    priority             = number<br/>    path_patterns        = optional(list(string), ["/*"])<br/>    host_headers         = optional(list(string), [])<br/>    health_check_path    = optional(string, "/")<br/>    health_check_matcher = optional(string, "200")<br/>    deregistration_delay = optional(number, 30)<br/>  })</pre> | `null` | no |
+| <a name="input_load_balancer"></a> [load\_balancer](#input\_load\_balancer) | Attach the service to a shared ALB listener. null = no load balancer (worker service) | <pre>object({<br/>    listener_arn         = string<br/>    alb_arn_suffix       = string<br/>    security_group_id    = string<br/>    priority             = number<br/>    path_patterns        = optional(list(string), ["/*"])<br/>    host_headers         = optional(list(string), [])<br/>    health_check_path    = optional(string, "/")<br/>    health_check_matcher = optional(string, "200")<br/>    deregistration_delay = optional(number, 30)<br/>  })</pre> | `null` | no |
 | <a name="input_log_retention_in_days"></a> [log\_retention\_in\_days](#input\_log\_retention\_in\_days) | CloudWatch log retention for all containers of the service | `number` | `14` | no |
 | <a name="input_memory"></a> [memory](#input\_memory) | Task memory in MiB | `number` | `512` | no |
 | <a name="input_name"></a> [name](#input\_name) | Service name, e.g. tabz-prod-web. Used for the service, task family, SG, target group (max 32 chars) | `string` | n/a | yes |

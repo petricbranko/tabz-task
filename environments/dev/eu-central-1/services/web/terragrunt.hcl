@@ -27,7 +27,29 @@ inputs = {
     }
   }
 
-  desired_count = 1
+  autoscaling = {
+    min_capacity        = 1
+    max_capacity        = 2
+    requests_per_target = 1000
+    cpu_target          = 70
+
+    # Scale to zero outside office hours (Mon-Fri 07:00-20:00 Europe/Belgrade, weekends off). Running `apply`
+    # while scaled down resets min/max and wakes dev up until the next evening: intended, you are using it.
+    scheduled_actions = {
+      night = {
+        min_capacity = 0
+        max_capacity = 0
+        schedule     = "cron(0 20 ? * MON-FRI *)"
+        timezone     = "Europe/Belgrade"
+      }
+      morning = {
+        min_capacity = 1
+        max_capacity = 2
+        schedule     = "cron(0 7 ? * MON-FRI *)"
+        timezone     = "Europe/Belgrade"
+      }
+    }
+  }
 
   enable_execute_command = true
   log_retention_in_days  = 7

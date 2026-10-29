@@ -42,6 +42,7 @@ dependency "alb" {
 
   mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
   mock_outputs = {
+    arn_suffix        = "app/mock/0000000000000000"
     security_group_id = "sg-00000000000000001"
     listeners = {
       http  = { arn = "arn:aws:elasticloadbalancing:eu-central-1:111111111111:listener/app/mock/0000000000000000/0000000000000001" }
@@ -79,6 +80,7 @@ inputs = {
 
   load_balancer = {
     listener_arn      = dependency.alb.outputs.listeners[local.listener_key].arn
+    alb_arn_suffix    = dependency.alb.outputs.arn_suffix
     security_group_id = dependency.alb.outputs.security_group_id
     priority          = 100
   }
