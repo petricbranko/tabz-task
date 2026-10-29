@@ -1,0 +1,18 @@
+# Terragrunt / Terraform working dirs
+.terragrunt-cache/
+.terraform/
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Offline validation backend (TG_BACKEND=local)
+environments/.local-state/
+
+# Never commit variable files with secrets
+*.auto.tfvars
+secrets.tfvars
+
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+# Tool versions used to build and validate this repo. `mise install` gives you the exact toolchain.
+[tools]
+terraform  = "1.17.1"
+terragrunt = "1.2.1"
