@@ -11,6 +11,10 @@
 set -euo pipefail
 
 REPO="petricbranko/tabz-task"
+# The repo uses GitHub's immutable OIDC subject: owner and repo are pinned by numeric ID, so a re-created
+# account/repo with the same name can never assume these roles.
+#   gh api repos/petricbranko/tabz-task/actions/oidc/customization/sub --jq .sub_claim_prefix
+SUB_PREFIX="repo:petricbranko@54512375/tabz-task@1438809153"
 PROJECT="tabz"
 REGION="eu-central-1"
 [ $# -eq 0 ] && set -- dev prod
@@ -44,7 +48,7 @@ for env in "${ENVS[@]}"; do
     "Condition": {
       "StringEquals": {
         "${PROVIDER_URL}:aud": "sts.amazonaws.com",
-        "${PROVIDER_URL}:sub": "repo:${REPO}:environment:${env}-plan"
+        "${PROVIDER_URL}:sub": "${SUB_PREFIX}:environment:${env}-plan"
       }
     }
   }]
