@@ -65,6 +65,8 @@ jobs:
         include:
           - env: dev
             role_var: AWS_PLAN_ROLE_ARN_DEV
+          - env: prod
+            role_var: AWS_PLAN_ROLE_ARN_PROD
     environment: ${{ matrix.env }}-plan
     env:
       ROLE_ARN: ${{ vars[matrix.role_var] }}
